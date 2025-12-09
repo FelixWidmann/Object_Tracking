@@ -23,7 +23,7 @@ This project focuses on applying **state-of-the-art Multi-Object Tracking (MOT)*
 
 The following five MOT models were implemented and compared:
 
-### 1. Regular MOT (Baseline)
+### 1. DeepSort (Baseline)
 
 * Kalman filter with constant velocity
 * IoU-based association
@@ -67,7 +67,7 @@ The models are evaluated based on:
 
 Trajectory visualizations and comparative statistics were generated for:
 
-* Regular MOT
+* DeepSort
 * ByteTrack
 * MeMOT
 * OC-SORT
