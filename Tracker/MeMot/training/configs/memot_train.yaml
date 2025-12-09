@@ -1,0 +1,14 @@
+train:
+  epochs: 30
+  batch_size: 1
+  lr: 0.0002
+
+model:
+  Ts: 3
+  Tl: 24
+  emb_dim: 128
+
+paths:
+  train_data: data/train
+  appearance_weights: models/appearance_head.pth
+  save_to: models/memot_memory.pth

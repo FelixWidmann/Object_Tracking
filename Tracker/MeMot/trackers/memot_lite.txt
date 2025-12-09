@@ -1,0 +1,375 @@
+# Lightweight MeMOT-like tracker (MeMOT-lite) implementation
+# This script implements a minimal memory-augmented multi-object tracker.
+# It is intended as a 3-day MVP: no heavy pretrained models, no Hungarian solver.
+# Greedy matching (IoU first, then appearance) + memory-based reactivation.
+#
+# The tracker API:
+#  - Tracker.update(detections, frame_id, image=None)
+#    detections: list of dicts with keys: 'bbox' (x1,y1,x2,y2), 'score' (float), optional 'feat' (1D np.array)
+#    frame_id: int
+#    image: optional, if provided and detection has no 'feat', the tracker will compute a color-histogram appearance feat.
+#
+#  - Tracker.tracks: dict of active tracks (track_id -> track dict)
+#  - Tracker.finished_tracks: list of finished track dicts (killed/expired)
+#
+# There is a small demo at the end that simulates moving boxes and temporary occlusion.
+#
+# Run this cell to execute the demo. The demo will print tracking results per frame.
+
+import numpy as np
+from collections import deque, defaultdict
+import math
+import random
+
+# -------------------- Utilities --------------------
+
+def iou(boxA, boxB):
+    # boxes: [x1, y1, x2, y2]
+    xA = max(boxA[0], boxB[0])
+    yA = max(boxA[1], boxB[1])
+    xB = min(boxA[2], boxB[2])
+    yB = min(boxA[3], boxB[3])
+    interW = max(0, xB - xA)
+    interH = max(0, yB - yA)
+    interArea = interW * interH
+    boxAArea = max(0, boxA[2] - boxA[0]) * max(0, boxA[3] - boxA[1])
+    boxBArea = max(0, boxB[2] - boxB[0]) * max(0, boxB[3] - boxB[1])
+    denom = boxAArea + boxBArea - interArea
+    if denom <= 0:
+        return 0.0
+    return interArea / denom
+
+def l2_normalize(x):
+    x = np.asarray(x, dtype=float)
+    norm = np.linalg.norm(x)
+    if norm == 0:
+        return x
+    return x / norm
+
+def cosine_sim(a, b):
+    a = np.asarray(a, dtype=float)
+    b = np.asarray(b, dtype=float)
+    na = np.linalg.norm(a)
+    nb = np.linalg.norm(b)
+    if na == 0 or nb == 0:
+        return 0.0
+    return float(np.dot(a, b) / (na * nb))
+
+# Simple appearance extractor: color histogram from crop (simulated here for demo)
+def color_histogram_feature(image, bbox, bins=16):
+    # image is a numpy array HxWx3, bbox is x1,y1,x2,y2 (float)
+    x1,y1,x2,y2 = [int(round(v)) for v in bbox]
+    h, w = image.shape[:2]
+    x1 = max(0, min(w-1, x1))
+    x2 = max(0, min(w-1, x2))
+    y1 = max(0, min(h-1, y1))
+    y2 = max(0, min(h-1, y2))
+    if x2 <= x1 or y2 <= y1:
+        return np.zeros(bins*3, dtype=float)
+    crop = image[y1:y2, x1:x2]
+    feat = []
+    for ch in range(3):
+        hist, _ = np.histogram(crop[:,:,ch].ravel(), bins=bins, range=(0,256))
+        feat.append(hist.astype(float))
+    feat = np.concatenate(feat)
+    feat = feat / (np.sum(feat) + 1e-6)
+    return feat
+
+# -------------------- Tracker Implementation --------------------
+
+class Track:
+    def __init__(self, tid, bbox, frame_id, score=1.0, feat=None, max_len=30):
+        self.id = tid
+        self.bbox = bbox  # last bbox
+        self.score = score
+        self.last_frame = frame_id
+        self.start_frame = frame_id
+        self.age = 0  # number of frames since creation
+        self.time_since_update = 0  # frames since last seen
+        self.hits = 1  # number of total detection matches
+        self.kalman = None  # placeholder if you want to add Kalman
+        self.memory = deque(maxlen=max_len)  # store recent embeddings
+        if feat is None:
+            self.feat = None
+        else:
+            self.feat = l2_normalize(feat)
+            self.memory.append(self.feat.copy())
+        self.active = True
+
+    def update(self, bbox, frame_id, score=1.0, feat=None):
+        self.bbox = bbox
+        self.score = score
+        self.last_frame = frame_id
+        self.age += 1
+        self.time_since_update = 0
+        self.hits += 1
+        if feat is not None:
+            feat = l2_normalize(feat)
+            self.feat = feat
+            self.memory.append(feat.copy())
+
+    def mark_missed(self):
+        self.time_since_update += 1
+        if self.time_since_update > 0:
+            self.active = False
+
+    def get_memory_aggregate(self):
+        # simple average of stored features
+        if len(self.memory) == 0:
+            return None
+        arr = np.stack(list(self.memory), axis=0)
+        mean = np.mean(arr, axis=0)
+        return l2_normalize(mean)
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'bbox': self.bbox,
+            'last_frame': self.last_frame,
+            'start_frame': self.start_frame,
+            'hits': self.hits,
+            'time_since_update': self.time_since_update,
+            'feat': None if self.feat is None else self.feat.tolist(),
+        }
+
+class MeMOTLite:
+    def __init__(self,
+                 iou_threshold=0.5,
+                 appearance_threshold=0.35,
+                 max_age=30,
+                 memory_len=20,
+                 iou_first=True):
+        """
+        iou_threshold: IoU threshold for easy IoU matching
+        appearance_threshold: cosine similarity threshold for appearance matching (0..1)
+        max_age: how many frames to keep 'lost' tracks before deleting
+        memory_len: how many appearance vectors to keep per track
+        iou_first: whether to match by IoU first, then appearance
+        """
+        self.iou_th = iou_threshold
+        self.appearance_th = appearance_threshold
+        self.max_age = max_age
+        self.memory_len = memory_len
+        self.tracks = dict()  # active tracks: tid -> Track
+        self.finished_tracks = []
+        self.next_id = 1
+        self.iou_first = iou_first
+
+    def _create_track(self, bbox, frame_id, score=1.0, feat=None):
+        tid = self.next_id
+        self.next_id += 1
+        tr = Track(tid, bbox, frame_id, score=score, feat=feat, max_len=self.memory_len)
+        self.tracks[tid] = tr
+        return tr
+
+    def _remove_track(self, tid):
+        tr = self.tracks.pop(tid, None)
+        if tr is not None:
+            self.finished_tracks.append(tr.to_dict())
+
+    def predict(self):
+        # Placeholder for a motion model (e.g., Kalman filter). Here we do nothing.
+        pass
+
+    def update(self, detections, frame_id, image=None):
+        """
+        detections: list of dicts {'bbox': [x1,y1,x2,y2], 'score': float, optional 'feat': np.array}
+        image: optional full frame used to compute features if feat not provided
+        """
+        # 1. compute features for detections if missing and image provided
+        for det in detections:
+            if 'feat' not in det or det['feat'] is None:
+                if image is not None:
+                    det['feat'] = color_histogram_feature(image, det['bbox'], bins=16)
+                else:
+                    det['feat'] = None
+
+        # 2. Prepare lists
+        det_boxes = [d['bbox'] for d in detections]
+        det_feats = [d.get('feat', None) for d in detections]
+        det_scores = [d.get('score', 1.0) for d in detections]
+        det_ids = list(range(len(detections)))
+
+        # 3. If no active tracks, create tracks for all detections above some score
+        if len(self.tracks) == 0:
+            for i, d in enumerate(detections):
+                if det_scores[i] >= 0.01:
+                    self._create_track(det_boxes[i], frame_id, score=det_scores[i], feat=det_feats[i])
+            return list(self.tracks.values())
+
+        # 4. Build match matrices (IoU and appearance)
+        track_ids = list(self.tracks.keys())
+        track_boxes = [self.tracks[tid].bbox for tid in track_ids]
+        track_feats = [self.tracks[tid].get_memory_aggregate() for tid in track_ids]
+
+        # IoU matrix: tracks x dets
+        iou_mat = np.zeros((len(track_ids), len(detections)), dtype=float)
+        for ti, tb in enumerate(track_boxes):
+            for di, db in enumerate(det_boxes):
+                iou_mat[ti, di] = iou(tb, db)
+
+        # Appearance similarity matrix (cosine): tracks x dets
+        app_mat = np.zeros((len(track_ids), len(detections)), dtype=float)
+        for ti, tf in enumerate(track_feats):
+            for di, df in enumerate(det_feats):
+                if tf is None or df is None:
+                    app_mat[ti, di] = 0.0
+                else:
+                    app_mat[ti, di] = cosine_sim(tf, df)
+
+        # 5. Matching strategy: IoU-first greedy then appearance for unmatched
+        matched_tracks = set()
+        matched_dets = set()
+        assignments = []  # (tid, det_index)
+
+        if self.iou_first:
+            # Greedy IoU matching above threshold
+            for ti in range(len(track_ids)):
+                best_di = -1
+                best_iou = self.iou_th
+                for di in range(len(detections)):
+                    if di in matched_dets:
+                        continue
+                    if iou_mat[ti, di] >= best_iou:
+                        best_iou = iou_mat[ti, di]
+                        best_di = di
+                if best_di != -1:
+                    assignments.append((track_ids[ti], best_di))
+                    matched_tracks.add(track_ids[ti])
+                    matched_dets.add(best_di)
+
+            # Now match remaining by appearance
+            for ti in range(len(track_ids)):
+                tid = track_ids[ti]
+                if tid in matched_tracks:
+                    continue
+                best_di = -1
+                best_app = self.appearance_th
+                for di in range(len(detections)):
+                    if di in matched_dets:
+                        continue
+                    if app_mat[ti, di] >= best_app:
+                        best_app = app_mat[ti, di]
+                        best_di = di
+                if best_di != -1:
+                    assignments.append((tid, best_di))
+                    matched_tracks.add(tid)
+                    matched_dets.add(best_di)
+        else:
+            # Appearance first (not used by default)
+            for ti in range(len(track_ids)):
+                best_di = -1
+                best_app = self.appearance_th
+                for di in range(len(detections)):
+                    if di in matched_dets:
+                        continue
+                    if app_mat[ti, di] >= best_app:
+                        best_app = app_mat[ti, di]
+                        best_di = di
+                if best_di != -1:
+                    assignments.append((track_ids[ti], best_di))
+                    matched_tracks.add(track_ids[ti])
+                    matched_dets.add(best_di)
+            for ti in range(len(track_ids)):
+                tid = track_ids[ti]
+                if tid in matched_tracks:
+                    continue
+                best_di = -1
+                best_iou = self.iou_th
+                for di in range(len(detections)):
+                    if di in matched_dets:
+                        continue
+                    if iou_mat[ti, di] >= best_iou:
+                        best_iou = iou_mat[ti, di]
+                        best_di = di
+                if best_di != -1:
+                    assignments.append((tid, best_di))
+                    matched_tracks.add(tid)
+                    matched_dets.add(best_di)
+
+        # 6. Update matched tracks
+        for tid, di in assignments:
+            det = detections[di]
+            self.tracks[tid].update(det['bbox'], frame_id, score=det.get('score',1.0), feat=det.get('feat', None))
+
+        # 7. Mark unmatched tracks as missed
+        unmatched_tracks = [tid for tid in track_ids if tid not in matched_tracks]
+        for tid in unmatched_tracks:
+            tr = self.tracks[tid]
+            tr.time_since_update += 1
+            if tr.time_since_update > self.max_age:
+                # expire track
+                self._remove_track(tid)
+
+        # 8. Create new tracks for unmatched detections (above a score threshold)
+        for di in range(len(detections)):
+            if di in matched_dets:
+                continue
+            det = detections[di]
+            # Score threshold may be low because MeMOT handles proposals; keep 0.3 for demo
+            if det.get('score',1.0) >= 0.3:
+                self._create_track(det['bbox'], frame_id, score=det.get('score',1.0), feat=det.get('feat', None))
+
+        # Return active tracks
+        return list(self.tracks.values())
+
+# -------------------- Demo: synthetic moving boxes --------------------
+
+def generate_synthetic_sequence(num_frames=30, seed=1):
+    """
+    Generate synthetic detections for 3 objects moving and one occluding event.
+    Returns list of frames, where each frame is list of detection dicts.
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+    frames = []
+    # Initialize three object centers and velocities
+    objs = [
+        {'cx':50, 'cy':50, 'vx':2, 'vy':1, 'w':30, 'h':40},   # object A
+        {'cx':150, 'cy':40, 'vx':-1, 'vy':1, 'w':28, 'h':38}, # object B
+        {'cx':100, 'cy':130, 'vx':0.8, 'vy':-1.2, 'w':32, 'h':42}, # object C
+    ]
+    for t in range(num_frames):
+        dets = []
+        # object A disappears between frames 10-14 (occlusion)
+        for i, o in enumerate(objs):
+            if i == 0 and 10 <= t <= 14:
+                # occluded: skip detection (simulate detector miss)
+                continue
+            cx = o['cx'] + o['vx'] * t
+            cy = o['cy'] + o['vy'] * t
+            x1 = cx - o['w']/2 + np.random.randn()*1.0
+            y1 = cy - o['h']/2 + np.random.randn()*1.0
+            x2 = cx + o['w']/2 + np.random.randn()*1.0
+            y2 = cy + o['h']/2 + np.random.randn()*1.0
+            score = 0.8 + 0.2*np.random.rand()
+            # We create a simple "appearance" based on object index: deterministic vector
+            base = np.zeros(30)
+            base[i*5:(i*5+5)] = 1.0
+            noise = 0.05 * np.random.randn(30)
+            feat = l2_normalize(base + noise)
+            dets.append({'bbox':[x1,y1,x2,y2], 'score':score, 'feat':feat})
+        # Add a false positive occasionally
+        if t%7 == 3:
+            dets.append({'bbox':[10+2*t, 10+1.5*t, 30+2*t, 30+1.5*t], 'score':0.4, 'feat':l2_normalize(np.random.randn(30))})
+        frames.append(dets)
+    return frames
+
+def demo_run():
+    seq = generate_synthetic_sequence(num_frames=35)
+    tracker = MeMOTLite(iou_threshold=0.4, appearance_threshold=0.4, max_age=6, memory_len=10, iou_first=True)
+    print("Running MeMOT-lite demo on synthetic sequence (occlusion for object A at frames 10-14)...\n")
+    for t, dets in enumerate(seq):
+        tracks = tracker.update(dets, frame_id=t, image=None)
+        out = []
+        for tr in tracks:
+            out.append({'id':tr.id, 'bbox':[round(v,1) for v in tr.bbox], 'last_frame':tr.last_frame, 'time_since_update':tr.time_since_update})
+        print(f"Frame {t:02d}: detections={len(dets):2d}  active_tracks={len(tracks):2d}  -> {out}")
+    print("\nFinished. Final finished_tracks count:", len(tracker.finished_tracks))
+    print("Active tracks remaining:", list(tracker.tracks.keys()))
+
+# Run the demo
+demo_run()
+
+# end of script
+

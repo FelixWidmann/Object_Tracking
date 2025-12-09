@@ -1,0 +1,400 @@
+"""
+More in-depth MeMOT-lite tracker.
+
+Dependencies: numpy, scipy
+
+Drop into trackers/memot.py and import:
+    from trackers.memot import MeMOT, color_histogram_feature
+
+API:
+    tracker = MeMOT(
+        iou_threshold=0.3,
+        appearance_threshold=0.35,
+        max_age=30,
+        memory_len=30,
+        lambda_iou=0.6,
+        lambda_app=0.4,
+        Ts=3,  # short-term length
+        alpha_dmat=0.05,  # long-term EMA update
+    )
+
+    # Each frame:
+    detections = [{'bbox':[x1,y1,x2,y2], 'score':s, 'feat': optional_numpy_array}, ...]
+    tracks = tracker.update(detections, frame_id, frame_image)  # frame_image optional for computing hist features
+    # tracks is list of Track objects
+"""
+
+import numpy as np
+from collections import deque
+from scipy.optimize import linear_sum_assignment
+import math
+import uuid
+
+# ----------------- Utilities -----------------
+
+def l2_normalize(x):
+    x = np.asarray(x, dtype=float)
+    norm = np.linalg.norm(x)
+    return x / (norm + 1e-12)
+
+def cosine_sim(a, b):
+    if a is None or b is None:
+        return 0.0
+    a = np.asarray(a, dtype=float)
+    b = np.asarray(b, dtype=float)
+    na = np.linalg.norm(a) + 1e-12
+    nb = np.linalg.norm(b) + 1e-12
+    return float(np.dot(a, b) / (na * nb))
+
+def iou(boxA, boxB):
+    xA = max(boxA[0], boxB[0])
+    yA = max(boxA[1], boxB[1])
+    xB = min(boxA[2], boxB[2])
+    yB = min(boxA[3], boxB[3])
+    interW = max(0, xB - xA)
+    interH = max(0, yB - yA)
+    interArea = interW * interH
+    areaA = max(0, boxA[2] - boxA[0]) * max(0, boxA[3] - boxA[1])
+    areaB = max(0, boxB[2] - boxB[0]) * max(0, boxB[3] - boxB[1])
+    denom = areaA + areaB - interArea
+    if denom <= 0:
+        return 0.0
+    return interArea / denom
+
+def bbox_to_xywh(box):
+    x1,y1,x2,y2 = box
+    w = x2 - x1
+    h = y2 - y1
+    cx = x1 + w/2.0
+    cy = y1 + h/2.0
+    return np.array([cx, cy, w, h], dtype=float)
+
+def xywh_to_bbox(xywh):
+    cx,cy,w,h = xywh
+    x1 = cx - w/2.0
+    y1 = cy - h/2.0
+    x2 = cx + w/2.0
+    y2 = cy + h/2.0
+    return [x1,y1,x2,y2]
+
+# ----------------- Simple Kalman Filter (constant velocity, 4D state) -----------------
+class KalmanFilterCV:
+    def __init__(self, dt=1.0, process_noise=1e-2, meas_noise=1e-1):
+        # state: [cx, cy, vx, vy] (we'll track center only, and width/height as direct)
+        self.dt = dt
+        # state transition
+        self.F = np.array([[1,0,dt,0],
+                           [0,1,0,dt],
+                           [0,0,1,0],
+                           [0,0,0,1]], dtype=float)
+        # control none
+        # measurement matrix (we measure cx, cy)
+        self.H = np.array([[1,0,0,0],
+                           [0,1,0,0]], dtype=float)
+        q = process_noise
+        self.Q = q * np.eye(4)
+        r = meas_noise
+        self.R = r * np.eye(2)
+        self.P = np.eye(4)  # covariance
+        self.x = np.zeros(4)
+
+    def initiate(self, cx, cy):
+        self.x = np.array([cx, cy, 0.0, 0.0], dtype=float)
+        self.P = np.eye(4)
+
+    def predict(self):
+        self.x = self.F.dot(self.x)
+        self.P = self.F.dot(self.P).dot(self.F.T) + self.Q
+        return self.x.copy()
+
+    def update(self, cx, cy):
+        z = np.array([cx, cy], dtype=float)
+        y = z - self.H.dot(self.x)
+        S = self.H.dot(self.P).dot(self.H.T) + self.R
+        K = self.P.dot(self.H.T).dot(np.linalg.inv(S))
+        self.x = self.x + K.dot(y)
+        I = np.eye(4)
+        self.P = (I - K.dot(self.H)).dot(self.P)
+
+    def current_state(self):
+        return self.x.copy()
+
+# ----------------- Appearance utility -----------------
+def color_histogram_feature(image, bbox, bins=16):
+    # image: HxWx3 uint8, bbox: [x1,y1,x2,y2]
+    x1,y1,x2,y2 = [int(round(v)) for v in bbox]
+    h,w = image.shape[:2]
+    x1 = max(0, min(w-1, x1))
+    x2 = max(0, min(w-1, x2))
+    y1 = max(0, min(h-1, y1))
+    y2 = max(0, min(h-1, y2))
+    if x2 <= x1 or y2 <= y1:
+        return np.zeros(bins*3, dtype=float)
+    crop = image[y1:y2, x1:x2]
+    feat = []
+    for c in range(3):
+        hist,_ = np.histogram(crop[:,:,c].ravel(), bins=bins, range=(0,256))
+        feat.append(hist.astype(float))
+    feat = np.concatenate(feat)
+    if feat.sum() > 0:
+        feat = feat / (feat.sum() + 1e-6)
+    return feat
+
+# ----------------- Track class -----------------
+class Track:
+    def __init__(self, tid, bbox, frame_id, score=1.0, feat=None, memory_len=30, alpha_dmat=0.05, Ts=3):
+        self.id = tid
+        self.bbox = bbox[:]  # last bbox [x1,y1,x2,y2]
+        self.score = score
+        self.start_frame = frame_id
+        self.last_frame = frame_id
+        self.hits = 1
+        self.time_since_update = 0
+        self.memory = deque(maxlen=memory_len)  # short-term storage
+        if feat is not None:
+            self.memory.append(l2_normalize(feat))
+            self.feat = l2_normalize(feat)
+        else:
+            self.feat = None
+        # DMAT-like long-term token (initialized as feat or zeros)
+        self.dmat = l2_normalize(feat) if feat is not None else None
+        self.alpha_dmat = alpha_dmat
+        self.Ts = Ts
+        # Kalman for center motion
+        cx,cy,w,h = bbox_to_xywh(self.bbox)
+        self.kf = KalmanFilterCV()
+        self.kf.initiate(cx, cy)
+        # store width/height separately; we won't Kalman them for simplicity
+        self.wh = np.array([w,h], dtype=float)
+        self.age = 0
+        self.active = True
+
+    def predict(self):
+        # propagate kf
+        state = self.kf.predict()  # [cx,cy,vx,vy]
+        cx,cy = state[0], state[1]
+        w,h = self.wh
+        self.bbox = xywh_to_bbox([cx,cy,w,h])
+        self.age += 1
+        self.time_since_update += 1
+
+    def update(self, bbox, frame_id, score=1.0, feat=None):
+        # update measured bbox & features
+        self.bbox = bbox[:]
+        self.score = score
+        self.last_frame = frame_id
+        self.hits += 1
+        self.time_since_update = 0
+        # update Kalman with measured center
+        cx,cy,w,h = bbox_to_xywh(bbox)
+        self.kf.update(cx, cy)
+        self.wh = np.array([w,h], dtype=float)
+        if feat is not None:
+            feat = l2_normalize(feat)
+            self.memory.append(feat)
+            self.feat = feat
+            if self.dmat is None:
+                self.dmat = feat.copy()
+            else:
+                # EMA update of DMAT
+                self.dmat = l2_normalize((1.0 - self.alpha_dmat) * self.dmat + self.alpha_dmat * feat)
+
+    def get_short_term(self):
+        # return mean of last Ts features
+        if len(self.memory) == 0:
+            return None
+        arr = np.stack(list(self.memory)[-self.Ts:], axis=0)
+        m = np.mean(arr, axis=0)
+        return l2_normalize(m)
+
+    def get_long_term(self):
+        return self.dmat
+
+    def get_track_embedding(self):
+        # fuse short and long: if both exist, concat then mean; else fallback
+        st = self.get_short_term()
+        lt = self.get_long_term()
+        if st is None and lt is None:
+            return None
+        if st is None:
+            return lt
+        if lt is None:
+            return st
+        # simple fusion: average of normalized concat halves
+        emb = l2_normalize(0.5 * st + 0.5 * lt)
+        return emb
+
+    def mark_missed(self):
+        self.time_since_update += 1
+        if self.time_since_update > 0:
+            self.active = False
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'bbox': self.bbox,
+            'last_frame': self.last_frame,
+            'start_frame': self.start_frame,
+            'hits': self.hits,
+            'time_since_update': self.time_since_update,
+            'feat': None if self.feat is None else self.feat.tolist()
+        }
+
+# ----------------- Main MeMOT class -----------------
+class MeMOT:
+    def __init__(self,
+                 iou_threshold=0.3,
+                 appearance_threshold=0.35,
+                 max_age=30,
+                 memory_len=30,
+                 lambda_iou=0.6,
+                 lambda_app=0.4,
+                 Ts=3,
+                 alpha_dmat=0.05):
+        """
+        lambda_iou + lambda_app should sum to 1.0 (weights for matching cost)
+        """
+        self.iou_th = iou_threshold
+        self.app_th = appearance_threshold
+        self.max_age = max_age
+        self.memory_len = memory_len
+        self.lambda_iou = lambda_iou
+        self.lambda_app = lambda_app
+        self.tracks = dict()  # tid -> Track
+        self.finished_tracks = []
+        self.next_id = 1
+        self.Ts = Ts
+        self.alpha_dmat = alpha_dmat
+
+    def _next_id(self):
+        nid = self.next_id
+        self.next_id += 1
+        return nid
+
+    def predict_all(self):
+        # call predict on all tracks (motion prediction)
+        for tr in list(self.tracks.values()):
+            tr.predict()
+
+    def _compute_cost_matrix(self, track_list, det_boxes, det_feats):
+        # cost = lambda_iou*(1 - IoU) + lambda_app*(1 - cosine_sim(emb, feat))
+        nT = len(track_list)
+        nD = len(det_boxes)
+        C = np.ones((nT, nD), dtype=float)  # initialize worst-case cost = 1
+        for i, tr in enumerate(track_list):
+            tr_emb = tr.get_track_embedding()
+            for j in range(nD):
+                db = det_boxes[j]
+                diou = iou(tr.bbox, db)
+                iou_cost = 1.0 - diou
+                # appearance cost
+                df = det_feats[j]
+                # measure track embedding similarity with detection feat
+                app_sim = 0.0
+                if df is not None:
+                    if tr_emb is not None:
+                        app_sim = cosine_sim(tr_emb, df)
+                    else:
+                        # try raw stored feat vs detection
+                        app_sim = cosine_sim(tr.feat, df)
+                app_cost = 1.0 - app_sim
+                # combined
+                cost = float(self.lambda_iou * iou_cost + self.lambda_app * app_cost)
+                # gating: if IoU very small and app small, keep high cost but allow assignment if necessary
+                C[i,j] = max(0.0, min(1.0, cost))
+        return C
+
+    def update(self, detections, frame_id, image=None):
+        """
+        detections: list of dicts {'bbox':[x1,y1,x2,y2], 'score':float, optional 'feat': np.array}
+        image: optional full frame used to compute features if missing
+        Returns: list of active Track objects after update
+        """
+        # ensure features for detections
+        for d in detections:
+            if 'feat' not in d or d['feat'] is None:
+                if image is not None:
+                    d['feat'] = color_histogram_feature(image, d['bbox'], bins=16)
+                else:
+                    d['feat'] = None
+
+        # Predict step
+        self.predict_all()
+
+        # Prepare lists
+        det_boxes = [d['bbox'] for d in detections]
+        det_feats = [l2_normalize(d['feat']) if d.get('feat', None) is not None else None for d in detections]
+        det_scores = [d.get('score', 1.0) for d in detections]
+
+        track_list = list(self.tracks.values())
+
+        if len(track_list) == 0:
+            # create tracks for all detections above low threshold
+            for i, d in enumerate(detections):
+                if det_scores[i] >= 0.01:
+                    tid = self._next_id()
+                    tr = Track(tid, d['bbox'], frame_id, score=det_scores[i], feat=det_feats[i],
+                               memory_len=self.memory_len, alpha_dmat=self.alpha_dmat, Ts=self.Ts)
+                    self.tracks[tid] = tr
+            return list(self.tracks.values())
+
+        # Compute cost matrix and solve assignment (Hungarian)
+        C = self._compute_cost_matrix(track_list, det_boxes, det_feats)
+        row_ind, col_ind = linear_sum_assignment(C)
+
+        matched_tracks = set()
+        matched_dets = set()
+        assignments = []
+
+        # Accept assignments if cost below threshold (we allow some flexibility)
+        for r, c in zip(row_ind, col_ind):
+            cost = C[r,c]
+            # translate cost to accept condition: require combined score good enough
+            # compute implied iou and app values for decision making (approx)
+            # For simplicity, accept if IoU > iou_th or appearance similarity > app_th or cost < 0.7
+            if cost < 0.85:  # soft acceptance (empirical)
+                tid = track_list[r].id
+                assignments.append((tid, c))
+                matched_tracks.add(tid)
+                matched_dets.add(c)
+
+        # Update matched tracks
+        for tid, di in assignments:
+            det = detections[di]
+            tr = self.tracks.get(tid, None)
+            if tr is None:
+                continue
+            tr.update(det['bbox'], frame_id, score=det.get('score',1.0), feat=det.get('feat',None))
+            tr.active = True
+
+        # mark unmatched tracks
+        for tr in track_list:
+            if tr.id not in matched_tracks:
+                tr.time_since_update += 1
+                tr.active = False
+                if tr.time_since_update > self.max_age:
+                    # expire
+                    self.finished_tracks.append(tr.to_dict())
+                    del self.tracks[tr.id]
+
+        # create new tracks for unmatched detections
+        for di in range(len(detections)):
+            if di in matched_dets:
+                continue
+            d = detections[di]
+            if d.get('score',1.0) >= 0.3:
+                tid = self._next_id()
+                tr = Track(tid, d['bbox'], frame_id, score=d.get('score',1.0),
+                           feat=det_feats[di], memory_len=self.memory_len,
+                           alpha_dmat=self.alpha_dmat, Ts=self.Ts)
+                self.tracks[tid] = tr
+
+        return list(self.tracks.values())
+
+    def get_active_tracks(self):
+        return list(self.tracks.values())
+
+    def reset(self):
+        self.tracks = {}
+        self.finished_tracks = []
+        self.next_id = 1
