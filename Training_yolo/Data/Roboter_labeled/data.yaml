@@ -1,0 +1,13 @@
+train: ../train/images
+val: ../valid/images
+test: ../test/images
+
+nc: 1
+names: ['Robots']
+
+roboflow:
+  workspace: eecs442-45fsf
+  project: labeling-6twqi
+  version: 2
+  license: CC BY 4.0
+  url: https://universe.roboflow.com/eecs442-45fsf/labeling-6twqi/dataset/2
